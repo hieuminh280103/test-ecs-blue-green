@@ -1,12 +1,12 @@
 # ── Stage 1: build dependencies ──────────────────────────────────────────────
-FROM python:3.12-alpine AS builder
+FROM public.ecr.aws/docker/library/python:3.12-alpine AS builder
 
 WORKDIR /app
 COPY app/requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
-FROM python:3.12-alpine
+FROM public.ecr.aws/docker/library/python:3.12-alpine
 
 WORKDIR /app
 
