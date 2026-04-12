@@ -19,7 +19,7 @@ COPY --from=builder /install /usr/local
 COPY app/ .
 
 ENV APP_VERSION=1.0.0 \
-    APP_COLOR=blue    \
+    APP_COLOR=green    \
     APP_ENV=production \
     PORT=80
 
