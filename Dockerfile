@@ -10,6 +10,8 @@ FROM public.ecr.aws/docker/library/python:3.12-alpine
 
 WORKDIR /app
 
+RUN apk add --no-cache curl
+
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
