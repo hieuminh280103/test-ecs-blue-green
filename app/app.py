@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-APP_VERSION = os.environ.get("APP_VERSION", "1.0.0")
+APP_VERSION = os.environ.get("APP_VERSION", "2.0.0")
 APP_COLOR   = os.environ.get("APP_COLOR", "green")
 APP_ENV     = os.environ.get("APP_ENV", "production")
 
