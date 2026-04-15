@@ -1,4 +1,5 @@
 # ── Stage 1: build dependencies ──────────────────────────────────────────────
+error
 FROM public.ecr.aws/docker/library/python:3.12-alpine AS builder
 
 WORKDIR /app
