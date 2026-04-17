@@ -1,6 +1,6 @@
 # CD — Build/push backend & frontend images to ECR, upload CodeDeploy bundle to S3, start CodePipeline.
 # Same layout as template.yml: validate-version → parallel deploy-backend / deploy-frontend.
-# Single manual version for both services; no :latest tag; fail if tag already exists on that ECR repo.
+# Single manual version for both services; no :latest tag; fail if tag already exists on that ECR repo
 
 name: CD — ECR & CodePipeline
 
