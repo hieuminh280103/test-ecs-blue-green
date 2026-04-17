@@ -1,0 +1,236 @@
+# CD — Build/push backend & frontend images to ECR, upload CodeDeploy bundle to S3, start CodePipeline.
+# Same layout as template.yml: validate-version → parallel deploy-backend / deploy-frontend.
+# Single manual version for both services; no :latest tag; fail if tag already exists on that ECR repo.
+
+name: CD — ECR & CodePipeline
+
+on:
+  workflow_dispatch: # Manual trigger only
+    inputs:
+      version:
+        description: "Version tag for both backend and frontend images (e.g. 1.2.3 or v1.2.3). Must not already exist on each ECR repository."
+        required: true
+        type: string
+
+permissions:
+  id-token: write # Required for OIDC authentication with AWS
+  contents: read
+
+concurrency:
+  group: deploy-ecs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-version:
+    name: Validate Version Format
+    runs-on: ubuntu-latest
+    outputs:
+      version_tag: ${{ steps.validate.outputs.version_tag }}
+    steps:
+      - name: Validate and normalize version
+        id: validate
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+
+          # Remove 'v' prefix if present
+          VERSION="${VERSION#v}"
+
+          # Validate semantic version format (major.minor.patch)
+          if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ Error: Invalid version format '${{ github.event.inputs.version }}'"
+            echo "   Expected format: v1.2.3 or 1.2.3"
+            exit 1
+          fi
+
+          # Add 'v' prefix for consistency
+          VERSION_TAG="v${VERSION}"
+          echo "✅ Valid version: $VERSION_TAG"
+          echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
+
+  deploy-backend:
+    name: Deploy Backend (ECR, CodeDeploy bundle, CodePipeline)
+    needs: validate-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      IMAGE_TAG: ${{ needs.validate-version.outputs.version_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          role-session-name: GitHubActions-deploy-be-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          ACCT="${AWS_ACCOUNT_ID:-}"
+          if [ -z "$ACCT" ]; then ACCT=$(aws sts get-caller-identity --query Account --output text); fi
+          aws ecr get-login-password --region "$AWS_REGION" | \
+            docker login --username AWS --password-stdin "${ACCT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+      - name: Build image, push to ECR (single tag, no latest), upload bundle, start pipeline
+        env:
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY_BACKEND }}
+          TASK_DEFINITION_FAMILY: ${{ vars.TASK_DEFINITION_FAMILY_BACKEND }}
+          CONTAINER_NAME: ${{ vars.CONTAINER_NAME_BACKEND }}
+          CONTAINER_PORT: ${{ vars.CONTAINER_PORT }}
+          S3_BUCKET: ${{ vars.GHA_S3_BUCKET }}
+          S3_OBJECT_KEY: ${{ vars.GHA_S3_OBJECT_KEY_BACKEND }}
+          PIPELINE_NAME: ${{ vars.CODEPIPELINE_NAME_BACKEND }}
+        run: |
+          set -euo pipefail
+          export AWS_DEFAULT_REGION="$AWS_REGION"
+          ACCT="${AWS_ACCOUNT_ID:-}"
+          if [ -z "$ACCT" ]; then ACCT=$(aws sts get-caller-identity --query Account --output text); fi
+          ECR_REGISTRY="${ACCT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          ECR_REPO_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          NEW_VERSION="${IMAGE_TAG}"
+          IMAGE_URI="${ECR_REPO_URI}:${NEW_VERSION}"
+          export CONTAINER_NAME
+
+          if aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=${NEW_VERSION}" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "❌ Error: Backend ECR already has image tag ${NEW_VERSION}."
+            exit 1
+          fi
+
+          echo "=== Docker build (single tag) ==="
+          docker build -f docker/backend/Dockerfile -t "$IMAGE_URI" .
+
+          echo "=== Push to ECR (no :latest) ==="
+          docker push "$IMAGE_URI"
+
+          printf '{"ImageURI":"%s"}' "$IMAGE_URI" > imageDetail.json
+
+          TASK_DEF_JSON=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION_FAMILY" \
+            --query taskDefinition --output json)
+          echo "$TASK_DEF_JSON" | python3 -c "import json,sys,os
+          td=json.load(sys.stdin)
+          for f in ['taskDefinitionArn','revision','status','requiresAttributes','compatibilities','registeredAt','registeredBy']:
+              td.pop(f,None)
+          for c in td.get('containerDefinitions',[]):
+              if c.get('name')==os.environ['CONTAINER_NAME']:
+                  c['image']='<IMAGE1_NAME>'
+          print(json.dumps(td,indent=2))" > taskdef.json
+
+          {
+            echo "version: 0.0"
+            echo "Resources:"
+            echo "  - TargetService:"
+            echo "      Type: AWS::ECS::Service"
+            echo "      Properties:"
+            echo "        TaskDefinition: <TASK_DEFINITION>"
+            echo "        LoadBalancerInfo:"
+            echo "          ContainerName: ${CONTAINER_NAME}"
+            echo "          ContainerPort: ${CONTAINER_PORT}"
+          } > appspec.yaml
+
+          zip -j deploy-bundle.zip imageDetail.json taskdef.json appspec.yaml
+          aws s3 cp deploy-bundle.zip "s3://${S3_BUCKET}/${S3_OBJECT_KEY}"
+          aws codepipeline start-pipeline-execution --name "$PIPELINE_NAME"
+          echo "✅ Backend: started pipeline ${PIPELINE_NAME} — approve in AWS Console to deploy."
+
+  deploy-frontend:
+    name: Deploy Frontend (ECR, CodeDeploy bundle, CodePipeline)
+    needs: validate-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      IMAGE_TAG: ${{ needs.validate-version.outputs.version_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          role-session-name: GitHubActions-deploy-fe-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          ACCT="${AWS_ACCOUNT_ID:-}"
+          if [ -z "$ACCT" ]; then ACCT=$(aws sts get-caller-identity --query Account --output text); fi
+          aws ecr get-login-password --region "$AWS_REGION" | \
+            docker login --username AWS --password-stdin "${ACCT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+      - name: Build image, push to ECR (single tag, no latest), upload bundle, start pipeline
+        env:
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY_FRONTEND }}
+          TASK_DEFINITION_FAMILY: ${{ vars.TASK_DEFINITION_FAMILY_FRONTEND }}
+          CONTAINER_NAME: ${{ vars.CONTAINER_NAME_FRONTEND }}
+          CONTAINER_PORT: ${{ vars.CONTAINER_PORT }}
+          S3_BUCKET: ${{ vars.GHA_S3_BUCKET }}
+          S3_OBJECT_KEY: ${{ vars.GHA_S3_OBJECT_KEY_FRONTEND }}
+          PIPELINE_NAME: ${{ vars.CODEPIPELINE_NAME_FRONTEND }}
+        run: |
+          set -euo pipefail
+          export AWS_DEFAULT_REGION="$AWS_REGION"
+          ACCT="${AWS_ACCOUNT_ID:-}"
+          if [ -z "$ACCT" ]; then ACCT=$(aws sts get-caller-identity --query Account --output text); fi
+          ECR_REGISTRY="${ACCT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          ECR_REPO_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          NEW_VERSION="${IMAGE_TAG}"
+          IMAGE_URI="${ECR_REPO_URI}:${NEW_VERSION}"
+          export CONTAINER_NAME
+
+          if aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=${NEW_VERSION}" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "❌ Error: Frontend ECR already has image tag ${NEW_VERSION}."
+            exit 1
+          fi
+
+          echo "=== Docker build (single tag) ==="
+          docker build -f docker/frontend/Dockerfile -t "$IMAGE_URI" .
+
+          echo "=== Push to ECR (no :latest) ==="
+          docker push "$IMAGE_URI"
+
+          printf '{"ImageURI":"%s"}' "$IMAGE_URI" > imageDetail.json
+
+          TASK_DEF_JSON=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION_FAMILY" \
+            --query taskDefinition --output json)
+          echo "$TASK_DEF_JSON" | python3 -c "import json,sys,os
+          td=json.load(sys.stdin)
+          for f in ['taskDefinitionArn','revision','status','requiresAttributes','compatibilities','registeredAt','registeredBy']:
+              td.pop(f,None)
+          for c in td.get('containerDefinitions',[]):
+              if c.get('name')==os.environ['CONTAINER_NAME']:
+                  c['image']='<IMAGE1_NAME>'
+          print(json.dumps(td,indent=2))" > taskdef.json
+
+          {
+            echo "version: 0.0"
+            echo "Resources:"
+            echo "  - TargetService:"
+            echo "      Type: AWS::ECS::Service"
+            echo "      Properties:"
+            echo "        TaskDefinition: <TASK_DEFINITION>"
+            echo "        LoadBalancerInfo:"
+            echo "          ContainerName: ${CONTAINER_NAME}"
+            echo "          ContainerPort: ${CONTAINER_PORT}"
+          } > appspec.yaml
+
+          zip -j deploy-bundle.zip imageDetail.json taskdef.json appspec.yaml
+          aws s3 cp deploy-bundle.zip "s3://${S3_BUCKET}/${S3_OBJECT_KEY}"
+          aws codepipeline start-pipeline-execution --name "$PIPELINE_NAME"
+          echo "✅ Frontend: started pipeline ${PIPELINE_NAME} — approve in AWS Console to deploy."
