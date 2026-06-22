@@ -23,7 +23,7 @@ def home():
     })
 
 
-@app.route("/health")
+@app.route("/health-error")
 def health():
     return jsonify({"status": "healthy", "version": APP_VERSION}), 200
 
